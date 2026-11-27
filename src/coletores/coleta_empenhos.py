@@ -1,13 +1,19 @@
-r"""Baixa o arquivo anual de despesa do Portal da Transparência do DF.
+r"""Baixa o arquivo anual de empenhos de uma das duas fontes.
 
 Uso, a partir de qualquer diretório:
     python src/coletores/coleta_empenhos.py --ano 2025
+    python src/coletores/coleta_empenhos.py --ano 2025 --fonte contratos-gov
     python src/coletores/coleta_empenhos.py --ano 2025 --saida caminho/despesa_2025.zip
 
-O arquivo Despesa_{ano}.zip traz as notas de empenho do GDF e as tabelas ligadas
-a elas (subelemento, descrição dos itens, liquidações e pagamentos). Ele é salvo
-byte a byte como foi recebido, em outputs/{ano}/, com a data e a hora do download
-no nome. Nada é descompactado, filtrado ou reescrito.
+Fontes (--fonte):
+    portal-df      (padrão) Despesa_{ano}.zip do Portal da Transparência do DF,
+                   com as notas de empenho do GDF e as tabelas ligadas a elas
+                   (subelemento, descrição dos itens, liquidações e pagamentos).
+    contratos-gov  comprasnet-contratos-anual-empenhos-{ano}.csv do Contratos.gov.br,
+                   publicado pela SEGES, com os empenhos das unidades federais.
+
+O arquivo é salvo byte a byte como foi recebido, em outputs/{ano}/, com a data e
+a hora do download no nome. Nada é descompactado, filtrado ou reescrito.
 """
 
 from __future__ import annotations
@@ -37,8 +43,54 @@ TIMEOUT_PADRAO = "60"
 TAMANHO_BLOCO = 1024 * 1024
 # [0-9] em vez de \d, que também aceitaria dígitos Unicode como "２０２５".
 PADRAO_ANO = re.compile(r"[0-9]{4}")
+# Começo do cabeçalho do CSV de empenhos do Contratos.gov.br. Só o começo é
+# conferido, para que uma coluna nova no fim não bloqueie a coleta.
+INICIO_CSV_CONTRATOS = b"id,unidade,unidade_nome,gestao,numero_empenho,"
+BOM_UTF8 = b"\xef\xbb\xbf"
 
 log = logging.getLogger("coleta_empenhos")
+
+
+@dataclass(frozen=True)
+class Fonte:
+    """O que muda entre as fontes: endereço, nomes e o teste do conteúdo.
+
+    Attributes:
+        variavel_url: Variável de ambiente que substitui a URL base.
+        url_padrao: URL base usada quando a variável não está definida.
+        caminho: Caminho do arquivo a partir da URL base, com {ano}.
+        nome_saida: Nome do arquivo salvo, depois da data e hora, com {ano}.
+        onde: Como a fonte aparece nas mensagens de ano não publicado.
+        tipo: Tipo de conteúdo esperado, citado quando ele não confere.
+    """
+
+    variavel_url: str
+    url_padrao: str
+    caminho: str
+    nome_saida: str
+    onde: str
+    tipo: str
+
+
+FONTES = {
+    "portal-df": Fonte(
+        variavel_url="PORTAL_DADOS_ABERTOS_URL",
+        url_padrao=BASE_PADRAO,
+        caminho="Despesa_{ano}.zip",
+        nome_saida="despesa_{ano}.zip",
+        onde="no portal",
+        tipo="um ZIP",
+    ),
+    "contratos-gov": Fonte(
+        variavel_url="CONTRATOS_DADOS_ABERTOS_URL",
+        url_padrao="https://repositorio.dados.gov.br/seges/comprasnet_contratos",
+        caminho="anual/{ano}/comprasnet-contratos-anual-empenhos-{ano}.csv",
+        nome_saida="contratos_empenhos_{ano}.csv",
+        onde="no repositório da SEGES",
+        tipo="o CSV de empenhos do Contratos.gov.br",
+    ),
+}
+FONTE_PADRAO = "portal-df"
 
 
 @dataclass(frozen=True)
@@ -71,7 +123,7 @@ class Download:
 
 
 class AnoNaoPublicado(Exception):
-    """O portal respondeu 404 para o arquivo do ano pedido."""
+    """A fonte respondeu 404 para o arquivo do ano pedido."""
 
 
 class DownloadIncompleto(Exception):
@@ -79,11 +131,11 @@ class DownloadIncompleto(Exception):
 
 
 class ArquivoInvalido(Exception):
-    """O conteúdo recebido não é um ZIP, como uma página de erro servida com 200."""
+    """O conteúdo recebido não é o esperado, como uma página de erro servida com 200."""
 
 
-def configuracao() -> Configuracao:
-    """Lê a configuração do ambiente e do .env da raiz do repositório.
+def configuracao(fonte: str = FONTE_PADRAO) -> Configuracao:
+    """Lê a configuração da fonte do ambiente e do .env da raiz do repositório.
 
     Variáveis já definidas no ambiente têm precedência sobre o .env.
 
@@ -92,10 +144,11 @@ def configuracao() -> Configuracao:
             fragmento, ou se o timeout não for um número positivo e finito.
     """
     load_dotenv(RAIZ_REPO / ".env", override=False)
-    url_base = os.getenv("PORTAL_DADOS_ABERTOS_URL", BASE_PADRAO).rstrip("/")
+    variavel = FONTES[fonte].variavel_url
+    url_base = os.getenv(variavel, FONTES[fonte].url_padrao).rstrip("/")
     url = urlsplit(url_base)
     if url.scheme not in ("https", "http") or not url.netloc or url.query or url.fragment:
-        raise ValueError("PORTAL_DADOS_ABERTOS_URL deve ser uma URL HTTP(S) sem query ou fragmento")
+        raise ValueError(f"{variavel} deve ser uma URL HTTP(S) sem query ou fragmento")
     try:
         timeout = float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", TIMEOUT_PADRAO))
     except ValueError as erro:
@@ -115,18 +168,31 @@ def valida_ano(texto: str) -> str:
     return texto
 
 
-def url_arquivo(config: Configuracao, ano: str) -> str:
+def url_arquivo(config: Configuracao, ano: str, fonte: str = FONTE_PADRAO) -> str:
     """Monta a URL do arquivo anual, como {url_base}/Despesa_2025.zip."""
-    return f"{config.url_base}/Despesa_{ano}.zip"
+    return f"{config.url_base}/{FONTES[fonte].caminho.format(ano=ano)}"
 
 
-def destino_arquivo(ano: str, momento: datetime) -> Path:
+def destino_arquivo(ano: str, momento: datetime, fonte: str = FONTE_PADRAO) -> Path:
     """Monta o caminho local de um download, como outputs/2025/20261115_102915_despesa_2025.zip.
 
     O nome começa pela data e hora do download (horário local), para que a ordem
-    alfabética seja a cronológica.
+    alfabética seja a cronológica; o resto do nome indica a fonte.
     """
-    return PASTA_SAIDA / ano / f"{momento:%Y%m%d_%H%M%S}_despesa_{ano}.zip"
+    return PASTA_SAIDA / ano / f"{momento:%Y%m%d_%H%M%S}_{FONTES[fonte].nome_saida.format(ano=ano)}"
+
+
+def conteudo_valido(arquivo: Path, fonte: str) -> bool:
+    """Confere se o arquivo baixado tem o formato da fonte.
+
+    No portal do DF, o arquivo tem de ser um ZIP. No Contratos.gov.br, tem de
+    começar pelo cabeçalho do CSV de empenhos, com ou sem BOM.
+    """
+    if fonte == "portal-df":
+        return zipfile.is_zipfile(arquivo)
+    with arquivo.open("rb") as entrada:
+        inicio = entrada.read(len(BOM_UTF8) + len(INICIO_CSV_CONTRATOS))
+    return inicio.removeprefix(BOM_UTF8).startswith(INICIO_CSV_CONTRATOS)
 
 
 def sessao_http() -> requests.Session:
@@ -154,18 +220,19 @@ def sessao_http() -> requests.Session:
     return sessao
 
 
-def baixa_arquivo(sessao: requests.Session, url: str, destino: Path, timeout: float) -> Download:
+def baixa_arquivo(sessao: requests.Session, url: str, destino: Path, timeout: float,
+                  fonte: str = FONTE_PADRAO) -> Download:
     """Baixa a URL em streaming e publica o arquivo completo de forma atômica.
 
     O corpo é gravado num arquivo .part ao lado do destino e só recebe o nome
-    final depois de chegar inteiro e de ser reconhecido como ZIP. Em qualquer
-    falha ou interrupção, o .part é removido.
+    final depois de chegar inteiro e de ter o formato da fonte (ver
+    conteudo_valido). Em qualquer falha ou interrupção, o .part é removido.
 
     Raises:
-        AnoNaoPublicado: Se o portal responder 404.
+        AnoNaoPublicado: Se a fonte responder 404.
         requests.HTTPError: Para outro status diferente de 200.
         DownloadIncompleto: Se o total gravado diferir do Content-Length.
-        ArquivoInvalido: Se o conteúdo recebido não for um ZIP.
+        ArquivoInvalido: Se o conteúdo recebido não tiver o formato da fonte.
         requests.RequestException: Para falhas de conexão ou de leitura.
         OSError: Para falhas ao gravar o arquivo.
     """
@@ -190,47 +257,50 @@ def baixa_arquivo(sessao: requests.Session, url: str, destino: Path, timeout: fl
                     f"recebidos {gravados} de {content_length} bytes declarados em {url}"
                 )
             last_modified = resposta.headers.get("Last-Modified")
-        if not zipfile.is_zipfile(part):
-            raise ArquivoInvalido(f"o conteúdo recebido de {url} não é um ZIP")
+        if not conteudo_valido(part, fonte):
+            raise ArquivoInvalido(f"o conteúdo recebido de {url} não é {FONTES[fonte].tipo}")
         part.replace(destino)
     finally:
         part.unlink(missing_ok=True)
     return Download(gravados, last_modified, content_length)
 
 
-def le_argumentos(argv: list[str] | None = None) -> tuple[str, Path | None]:
-    """Lê --ano e --saida; argumentos inválidos encerram com código 2 pelo argparse."""
+def le_argumentos(argv: list[str] | None = None) -> tuple[str, Path | None, str]:
+    """Lê --ano, --saida e --fonte; argumentos inválidos encerram com código 2 pelo argparse."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--ano", required=True, type=valida_ano,
                         help="Ano com quatro dígitos (ex.: 2025).")
+    parser.add_argument("--fonte", choices=tuple(FONTES), default=FONTE_PADRAO,
+                        help="De onde baixar (padrão: portal-df).")
     parser.add_argument(
         "--saida", type=Path,
-        help="Caminho completo do ZIP a gravar, relativo ao diretório de execução se não for "
-             "absoluto; sem ele, o arquivo vai para outputs/{ano}/ com nome automático.",
+        help="Caminho completo do arquivo a gravar, relativo ao diretório de execução se não "
+             "for absoluto; sem ele, o arquivo vai para outputs/{ano}/ com nome automático.",
     )
     args = parser.parse_args(argv)
-    return args.ano, args.saida
+    return args.ano, args.saida, args.fonte
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Executa a coleta do ano pedido e devolve o código de saída.
+    """Executa a coleta do ano e da fonte pedidos e devolve o código de saída.
 
     Returns:
         0 quando o arquivo é salvo; 1 para falha de rede, HTTP diferente de 200 e
-        404, download incompleto, conteúdo que não é ZIP ou erro de escrita; 2 para
-        configuração inválida, ano não publicado ou destino já existente.
+        404, download incompleto, conteúdo fora do formato da fonte ou erro de
+        escrita; 2 para configuração inválida, ano não publicado ou destino já
+        existente.
     """
-    ano, saida = le_argumentos(argv)
+    ano, saida, fonte = le_argumentos(argv)
     try:
-        config = configuracao()
+        config = configuracao(fonte)
     except ValueError as erro:
         log.error("Configuração inválida: %s", erro)
         return 2
 
-    url = url_arquivo(config, ano)
-    destino = saida.resolve() if saida is not None else destino_arquivo(ano, datetime.now())
+    url = url_arquivo(config, ano, fonte)
+    destino = saida.resolve() if saida is not None else destino_arquivo(ano, datetime.now(), fonte)
     if destino.exists():
         log.error("%s já existe; nada foi baixado", destino)
         return 2
@@ -239,9 +309,9 @@ def main(argv: list[str] | None = None) -> int:
     inicio = time.monotonic()
     try:
         with sessao_http() as sessao:
-            download = baixa_arquivo(sessao, url, destino, config.timeout)
+            download = baixa_arquivo(sessao, url, destino, config.timeout, fonte)
     except AnoNaoPublicado:
-        log.error("Ano %s não publicado no portal (%s)", ano, url)
+        log.error("Ano %s não publicado %s (%s)", ano, FONTES[fonte].onde, url)
         return 2
     except (requests.RequestException, DownloadIncompleto, ArquivoInvalido, OSError) as erro:
         log.error("Falha no download: %s", erro)

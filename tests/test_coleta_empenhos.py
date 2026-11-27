@@ -35,6 +35,19 @@ def zip_exemplo():
 
 CORPO = zip_exemplo()
 
+# Início do CSV anual de empenhos do Contratos.gov.br, com os 29 campos publicados.
+CSV_CONTRATOS = (
+    "id,unidade,unidade_nome,gestao,numero_empenho,data_emissao,cpf_cnpj_credor,credor,"
+    "fonte_recurso,ptres,modalidade_licitacao_siafi,naturezadespesa,naturezadespesa_descricao,"
+    "planointerno,planointerno_descricao,valor_empenhado,valor_aliquidar,valor_liquidado,"
+    "valor_pago,valor_rpinscrito,valor_rpaliquidar,valor_rpaliquidado,valor_rppago,"
+    "informacao_complementar,sistema_origem,contrato_id,created_at,updated_at,id_cipi\n"
+    "12969171,787700,HOSPITAL NAVAL DE BRASÍLIA,00001,2025NE000305,2025-02-10,"
+    "03.408.873/0001-26,CLÍNICA,1005000144,,,339039,OUTROS SERVIÇOS,B42201002DU,CUSTEIO,"
+    "20150.0,0.0,0.0,20150.0,0,0,0,0,texto,COMPRASNET CONTRATOS,,data,data,\n"
+).encode("utf-8")
+CAMINHO_CONTRATOS = "/base/anual/2025/comprasnet-contratos-anual-empenhos-2025.csv"
+
 
 def resposta(status=200, corpo=CORPO, cabecalhos=None, content_length=None):
     """Descreve uma resposta do servidor local.
@@ -143,16 +156,57 @@ class TestConfiguracao(unittest.TestCase):
             coletor.PASTA_SAIDA / "2025" / "20261115_102915_despesa_2025.zip",
         )
 
+    def test_contratos_url_do_arquivo_anual(self):
+        config = coletor.Configuracao("https://exemplo.gov.br/base", 60.0)
+        self.assertEqual(
+            coletor.url_arquivo(config, "2025", "contratos-gov"),
+            "https://exemplo.gov.br/base/anual/2025/comprasnet-contratos-anual-empenhos-2025.csv",
+        )
+
+    def test_contratos_padroes(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(coletor, "load_dotenv"):
+            config = coletor.configuracao("contratos-gov")
+        self.assertEqual(config.url_base, "https://repositorio.dados.gov.br/seges/comprasnet_contratos")
+        self.assertEqual(config.timeout, 60.0)
+
+    def test_contratos_usa_a_propria_variavel_de_url(self):
+        valores = {"PORTAL_DADOS_ABERTOS_URL": "http://127.0.0.1:8000/portal",
+                   "CONTRATOS_DADOS_ABERTOS_URL": "http://127.0.0.1:8000/seges/"}
+        with patch.dict(os.environ, valores, clear=True), patch.object(coletor, "load_dotenv"):
+            self.assertEqual(coletor.configuracao("contratos-gov").url_base,
+                             "http://127.0.0.1:8000/seges")
+            self.assertEqual(coletor.configuracao("portal-df").url_base,
+                             "http://127.0.0.1:8000/portal")
+
+    def test_contratos_url_invalida(self):
+        with patch.dict(os.environ, {"CONTRATOS_DADOS_ABERTOS_URL": "ftp://x.gov.br/base"},
+                        clear=True), patch.object(coletor, "load_dotenv"):
+            with self.assertRaises(ValueError) as erro:
+                coletor.configuracao("contratos-gov")
+        self.assertIn("CONTRATOS_DADOS_ABERTOS_URL", str(erro.exception))
+
+    def test_contratos_destino_com_data_e_hora_do_download(self):
+        self.assertEqual(
+            coletor.destino_arquivo("2025", MOMENTO, "contratos-gov"),
+            coletor.PASTA_SAIDA / "2025" / "20261115_102915_contratos_empenhos_2025.csv",
+        )
+
 
 class TestArgumentos(unittest.TestCase):
     def test_ano_e_saida(self):
-        self.assertEqual(coletor.le_argumentos(["--ano", "2025"]), ("2025", None))
+        self.assertEqual(coletor.le_argumentos(["--ano", "2025"]), ("2025", None, "portal-df"))
         self.assertEqual(coletor.le_argumentos(["--ano", "2025", "--saida", "x.zip"]),
-                         ("2025", Path("x.zip")))
+                         ("2025", Path("x.zip"), "portal-df"))
+
+    def test_fonte(self):
+        self.assertEqual(coletor.le_argumentos(["--ano", "2025", "--fonte", "contratos-gov"]),
+                         ("2025", None, "contratos-gov"))
+        self.assertEqual(coletor.le_argumentos(["--ano", "2025", "--fonte", "portal-df"]),
+                         ("2025", None, "portal-df"))
 
     def test_ano_invalido_ou_ausente(self):
         for argv in (["--ano", "25"], ["--ano", "２０２５"], ["--ano", "2025a"], [],
-                     ["--ano", "2025", "--mes", "07"]):
+                     ["--ano", "2025", "--mes", "07"], ["--ano", "2025", "--fonte", "siafi"]):
             with self.subTest(argv=argv), patch("sys.stderr"), self.assertRaises(SystemExit) as erro:
                 coletor.le_argumentos(argv)
             self.assertEqual(erro.exception.code, 2)
@@ -220,6 +274,50 @@ class TestDownload(ComServidor):
         self.baixa()  # a primeira retentativa do urllib3 não espera
         self.assertEqual(self.destino.read_bytes(), CORPO)
         self.assertEqual(len(self.servidor.caminhos), 2)
+
+
+class TestDownloadContratos(ComServidor):
+    def setUp(self):
+        super().setUp()
+        self.destino = self.pasta / "empenhos.csv"
+        self.part = self.destino.with_name(self.destino.name + ".part")
+        self.url = coletor.url_arquivo(coletor.Configuracao(self.servidor.base, 5.0), "2025",
+                                       "contratos-gov")
+
+    def baixa(self):
+        with coletor.sessao_http() as sessao:
+            return coletor.baixa_arquivo(sessao, self.url, self.destino, 5.0, "contratos-gov")
+
+    def test_csv_identico_byte_a_byte(self):
+        self.servidor.respostas = [resposta(corpo=CSV_CONTRATOS,
+                                            cabecalhos={"Last-Modified": LAST_MODIFIED})]
+        download = self.baixa()
+        self.assertEqual(self.destino.read_bytes(), CSV_CONTRATOS)
+        self.assertEqual(download.last_modified, LAST_MODIFIED)
+        self.assertEqual(self.servidor.caminhos, [CAMINHO_CONTRATOS])
+        self.assertFalse(self.part.exists())
+
+    def test_conteudo_que_nao_e_o_csv_de_empenhos(self):
+        # Página de erro, ZIP ou outro CSV servidos com 200 não podem virar o arquivo salvo.
+        for corpo in (b"<html>erro</html>", CORPO, b"id,numero,fornecedor\n1,2,3\n", b""):
+            with self.subTest(corpo=corpo[:12]):
+                self.servidor.respostas = [resposta(corpo=corpo)]
+                with self.assertRaises(coletor.ArquivoInvalido):
+                    self.baixa()
+                self.assertFalse(self.destino.exists())
+                self.assertFalse(self.part.exists())
+
+    def test_csv_com_bom(self):
+        corpo = b"\xef\xbb\xbf" + CSV_CONTRATOS
+        self.servidor.respostas = [resposta(corpo=corpo)]
+        self.baixa()
+        self.assertEqual(self.destino.read_bytes(), corpo)
+
+    def test_404(self):
+        self.servidor.respostas = [resposta(status=404, corpo=b"")]
+        with self.assertRaises(coletor.AnoNaoPublicado):
+            self.baixa()
+        self.assertFalse(self.destino.exists())
 
 
 class TestMain(ComServidor):
@@ -323,6 +421,72 @@ class TestMain(ComServidor):
         self.assertIn("PORTAL_DADOS_ABERTOS_URL", log)
 
 
+class TestMainContratos(TestMain):
+    """Mesmo fluxo de main(), com --fonte contratos-gov."""
+
+    def setUp(self):
+        super().setUp()
+        contexto = patch.dict(os.environ, {"CONTRATOS_DADOS_ABERTOS_URL": self.servidor.base})
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        self.servidor.respostas = [resposta(corpo=CSV_CONTRATOS)]
+        self.destino = self.pasta / "2025" / "20261115_102915_contratos_empenhos_2025.csv"
+
+    def executa(self, *argumentos):
+        return super().executa(*(list(argumentos) or ["--ano", "2025"]), "--fonte", "contratos-gov")
+
+    def test_main_sucesso(self):
+        self.servidor.respostas = [resposta(corpo=CSV_CONTRATOS,
+                                            cabecalhos={"Last-Modified": LAST_MODIFIED})]
+        codigo, log = self.executa()
+        self.assertEqual(codigo, 0)
+        self.assertEqual(self.destino.read_bytes(), CSV_CONTRATOS)
+        self.assertEqual(self.servidor.caminhos, [CAMINHO_CONTRATOS])
+        self.assertIn(LAST_MODIFIED, log)
+        self.assertIn(str(self.destino), log)
+
+    def test_main_saida_absoluta_substitui_destino_automatico(self):
+        saida = self.pasta / "outro" / "empenhos.csv"
+        codigo, log = self.executa("--ano", "2025", "--saida", str(saida))
+        self.assertEqual(codigo, 0)
+        self.assertEqual(saida.read_bytes(), CSV_CONTRATOS)
+        self.assertFalse((self.pasta / "2025").exists())
+
+    def test_main_saida_relativa_ao_diretorio_de_execucao(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            diretorio_anterior = os.getcwd()
+            os.chdir(tmp)
+            try:
+                codigo, _ = self.executa("--ano", "2025", "--saida", "dados/empenhos.csv")
+            finally:
+                os.chdir(diretorio_anterior)
+            self.assertEqual(codigo, 0)
+            self.assertEqual((Path(tmp) / "dados" / "empenhos.csv").read_bytes(), CSV_CONTRATOS)
+
+    def test_main_404(self):
+        self.servidor.respostas = [resposta(status=404, corpo=b"")]
+        codigo, log = self.executa()
+        self.assertEqual(codigo, 2)
+        self.assertIn("Ano 2025 não publicado no repositório da SEGES", log)
+        self.assertFalse(self.destino.parent.exists())
+
+    def test_main_falhas_de_download_saem_com_1(self):
+        for falha in (resposta(status=403, corpo=b""),
+                      resposta(corpo=CSV_CONTRATOS, content_length=len(CSV_CONTRATOS) + 100),
+                      resposta(corpo=b"<html>erro</html>")):
+            with self.subTest(status=falha["status"], corpo=falha["corpo"][:10]):
+                self.servidor.respostas = [falha]
+                codigo, _ = self.executa()
+                self.assertEqual(codigo, 1)
+                self.assertFalse(self.destino.exists())
+
+    def test_main_configuracao_invalida(self):
+        with patch.dict(os.environ, {"CONTRATOS_DADOS_ABERTOS_URL": "https://x.gov.br/base?a=1"}):
+            codigo, log = self.executa()
+        self.assertEqual(codigo, 2)
+        self.assertIn("CONTRATOS_DADOS_ABERTOS_URL", log)
+
+
 def bash_compativel():
     """Retorna um bash que aceite caminhos do Windows, ou None.
 
@@ -355,6 +519,23 @@ class TestWrapper(unittest.TestCase):
             self.assertEqual(processo.returncode, 0, processo.stdout + processo.stderr)
             self.assertEqual((Path(tmp) / "outputs" / "despesa.zip").read_bytes(), CORPO)
         self.assertEqual(servidor.caminhos, ["/base/Despesa_2025.zip"])
+
+    @unittest.skipUnless(bash_compativel(), "bash compatível indisponível")
+    def test_wrapper_repassa_a_fonte(self):
+        servidor = ServidorLocal()
+        self.addCleanup(servidor.fecha)
+        servidor.respostas = [resposta(corpo=CSV_CONTRATOS)]
+        ambiente = {**os.environ, "CONTRATOS_DADOS_ABERTOS_URL": servidor.base,
+                    "DOWNLOAD_TIMEOUT_SECONDS": "5"}
+        with tempfile.TemporaryDirectory() as tmp:
+            processo = subprocess.run(
+                [bash_compativel(), (RAIZ / "src" / "coletores" / "run-coleta-empenhos.sh").as_posix(),
+                 "--ano", "2025", "--fonte", "contratos-gov", "--saida", "outputs/empenhos.csv"],
+                cwd=tmp, env=ambiente, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(processo.returncode, 0, processo.stdout + processo.stderr)
+            self.assertEqual((Path(tmp) / "outputs" / "empenhos.csv").read_bytes(), CSV_CONTRATOS)
+        self.assertEqual(servidor.caminhos, [CAMINHO_CONTRATOS])
 
 
 if __name__ == "__main__":
